@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pittsburgh HOV Lane Status</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+        }
+
+        .header {
+            text-align: center;
+            padding: 20px;
+            background: #16213e;
+            border-bottom: 2px solid #0f3460;
+        }
+
+        .header h1 {
+            font-size: 1.5rem;
+            color: #94b8f8;
+            margin-bottom: 5px;
+        }
+
+        .header .subtitle {
+            font-size: 0.85rem;
+            color: #777;
+        }
+
+        /* Status Banner */
+        .status-banner {
+            text-align: center;
+            padding: 30px 20px;
+            transition: background 0.5s ease;
+        }
+
+        .status-banner.OPEN { background: linear-gradient(135deg, #0a5c0a, #1a8c1a); }
+        .status-banner.OPEN_INBOUND { background: linear-gradient(135deg, #0a5c0a, #1a8c1a); }
+        .status-banner.OPEN_OUTBOUND { background: linear-gradient(135deg, #0a4c5c, #1a7c8c); }
+        .status-banner.OPEN_UNRESTRICTED { background: linear-gradient(135deg, #1a3a6e, #2a6a9e); }
+        .status-banner.LIKELY_OPEN { background: linear-gradient(135deg, #b8860b, #e8a317); }
+        .status-banner.CLOSED { background: linear-gradient(135deg, #8b0000, #c0392b); }
+        .status-banner.UNKNOWN { background: linear-gradient(135deg, #555, #777); }
+        .status-banner.UNCLEAR { background: linear-gradient(135deg, #8B8000, #b8a900); }
+        .status-banner.ERROR { background: linear-gradient(135deg, #8B4500, #c06000); }
+        .status-banner.ANALYZING { background: linear-gradient(135deg, #1a3a6e, #2a5aae); }
+
+        .status-text {
+            font-size: 3.5rem;
+            font-weight: 800;
+            text-shadow: 2px 2px 8px rgba(0,0,0,0.5);
+            letter-spacing: 4px;
+        }
+
+        .status-subtitle {
+            font-size: 1rem;
+            margin-top: 8px;
+            opacity: 0.9;
+        }
+
+        .last-check {
+            font-size: 0.8rem;
+            margin-top: 10px;
+            opacity: 0.7;
+        }
+
+        /* Controls */
+        .controls {
+            text-align: center;
+            padding: 15px;
+            background: #16213e;
+        }
+
+        .btn {
+            background: #0f3460;
+            color: #94b8f8;
+            border: 1px solid #1a5276;
+            padding: 10px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+            margin: 0 5px;
+        }
+
+        .btn:hover { background: #1a5276; }
+        .btn:disabled { opacity: 0.5; cursor: wait; }
+        .btn.active { background: #1a8c1a; border-color: #2ab02a; color: white; }
+
+        /* Camera Grid */
+        .cameras {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            padding: 20px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        @media (max-width: 900px) {
+            .cameras { grid-template-columns: 1fr; }
+        }
+
+        @media (min-width: 1200px) {
+            .cameras { grid-template-columns: 1fr 1fr 1fr 1fr; }
+        }
+
+        .camera-card {
+            background: #16213e;
+            border-radius: 10px;
+            overflow: hidden;
+            border: 1px solid #0f3460;
+        }
+
+        .camera-header {
+            padding: 12px 16px;
+            background: #0f3460;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .camera-title {
+            font-size: 0.9rem;
+            font-weight: 600;
+        }
+
+        .camera-status {
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        .camera-status.OPEN { background: #1a8c1a; }
+        .camera-status.LIKELY_OPEN { background: #e8a317; color: #000; }
+        .camera-status.CLOSED { background: #c0392b; }
+        .camera-status.UNKNOWN { background: #555; }
+        .camera-status.UNCLEAR { background: #8B8000; }
+        .camera-status.ERROR { background: #8B4500; }
+
+        .camera-feed {
+            position: relative;
+            width: 100%;
+            background: #000;
+        }
+
+        .camera-feed img {
+            width: 100%;
+            display: block;
+        }
+
+        .camera-feed video {
+            width: 100%;
+            display: block;
+        }
+
+        .feed-toggle {
+            display: flex;
+            border-bottom: 1px solid #0f3460;
+        }
+
+        .feed-toggle button {
+            flex: 1;
+            padding: 8px;
+            background: #1a1a2e;
+            color: #94b8f8;
+            border: none;
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: background 0.2s;
+        }
+
+        .feed-toggle button:hover { background: #0f3460; }
+        .feed-toggle button.active {
+            background: #0f3460;
+            border-bottom: 2px solid #94b8f8;
+        }
+
+        .camera-analysis {
+            padding: 12px 16px;
+            border-top: 1px solid #0f3460;
+            font-size: 0.85rem;
+            line-height: 1.5;
+        }
+
+        .camera-analysis .label {
+            color: #94b8f8;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .camera-analysis .reasoning {
+            color: #aaa;
+        }
+
+        .loading-spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #555;
+            border-top-color: #94b8f8;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .analyzing-indicator {
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        .no-video-msg {
+            padding: 40px;
+            text-align: center;
+            color: #666;
+            font-size: 0.85rem;
+        }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <h1>🚗 Pittsburgh HOV Lane Status</h1>
+    <div class="subtitle">Monitoring 4 HOV cameras: Bedford Ave, MM 5.5, MM 1.2, MM 1.4</div>
+</div>
+
+<div class="status-banner UNKNOWN" id="statusBanner">
+    <div class="status-text" id="statusText">CHECKING...</div>
+    <div class="status-subtitle" id="statusSubtitle">Analyzing camera feeds...</div>
+    <div class="last-check" id="lastCheck">Last checked: Never</div>
+    <div class="last-check" id="scheduleInfo" style="margin-top:4px;"></div>
+</div>
+
+<div class="controls">
+    <button class="btn" id="analyzeBtn" onclick="triggerAnalysis()">
+        🔍 Analyze Now
+    </button>
+    <button class="btn" id="autoRefreshBtn" onclick="toggleAutoRefresh()">
+        🔄 Auto-Refresh: ON
+    </button>
+</div>
+
+<div class="cameras">
+    <!-- Bedford Ave Camera -->
+    <div class="camera-card">
+        <div class="camera-header">
+            <span class="camera-title">📷 I-579 HOV @ Bedford Ave</span>
+            <span class="camera-status UNKNOWN" id="bedfordStatus">UNKNOWN</span>
+        </div>
+        <div class="feed-toggle">
+            <button class="active" onclick="switchFeed('bedford', 'image', this)">📸 Snapshot</button>
+            <button onclick="switchFeed('bedford', 'video', this)">🎥 Live Video</button>
+        </div>
+        <div class="camera-feed" id="bedfordFeed">
+            <img id="bedfordImage" src="/api/camera/bedford/image" alt="Bedford Ave Camera">
+        </div>
+        <div class="camera-analysis">
+            <div class="label">AI Analysis:</div>
+            <div class="reasoning" id="bedfordReasoning">Waiting for first analysis...</div>
+        </div>
+    </div>
+
+    <!-- MM 5.5 Camera -->
+    <div class="camera-card">
+        <div class="camera-header">
+            <span class="camera-title">📷 I-279 @ MM 5.5</span>
+            <span class="camera-status" id="mm55Status" style="background:#555">CHECKING</span>
+        </div>
+        <div class="feed-toggle">
+            <button class="active" onclick="switchFeed('mm55', 'image', this)">📸 Snapshot</button>
+            <button onclick="switchFeed('mm55', 'video', this)">🎥 Live Video</button>
+        </div>
+        <div class="camera-feed" id="mm55Feed">
+            <img id="mm55Image" src="/api/camera/mm55/image" alt="MM 5.5 Camera">
+        </div>
+        <div class="camera-analysis">
+            <div class="label">🛣️ Exit Lane:</div>
+            <div class="reasoning" id="mm55Reasoning">Checking...</div>
+        </div>
+    </div>
+
+    <!-- MM 1.2 Camera -->
+    <div class="camera-card">
+        <div class="camera-header">
+            <span class="camera-title">📷 I-279 @ MM 1.2</span>
+            <span class="camera-status" id="mm12Status" style="background:#555">CHECKING</span>
+        </div>
+        <div class="camera-feed" id="mm12Feed">
+            <img id="mm12Image" src="/api/camera/mm12/image" alt="MM 1.2 Camera">
+        </div>
+        <div class="camera-analysis">
+            <div class="label">🛣️ HOV Roadway:</div>
+            <div class="reasoning" id="mm12Reasoning">Checking...</div>
+        </div>
+    </div>
+
+    <!-- MM 1.4 Camera -->
+    <div class="camera-card">
+        <div class="camera-header">
+            <span class="camera-title">📷 I-279 @ MM 1.4</span>
+            <span class="camera-status" id="mm14Status" style="background:#555">CHECKING</span>
+        </div>
+        <div class="camera-feed" id="mm14Feed">
+            <img id="mm14Image" src="/api/camera/mm14/image" alt="MM 1.4 Camera">
+        </div>
+        <div class="camera-analysis">
+            <div class="label">🛣️ HOV Roadway:</div>
+            <div class="reasoning" id="mm14Reasoning">Checking...</div>
+        </div>
+    </div>
+</div>
+
+<script>
+    let autoRefresh = true;
+    let statusInterval = null;
+    let imageInterval = null;
+    let hlsPlayers = {};
+    let currentFeeds = { bedford: 'image', mm55: 'image', mm12: 'image', mm14: 'image' };
+
+    // Fetch and update status
+    async function fetchStatus() {
+        try {
+            const resp = await fetch('/api/status');
+            const data = await resp.json();
+            updateUI(data);
+        } catch (e) {
+            console.error('Failed to fetch status:', e);
+        }
+    }
+
+    function updateUI(data) {
+        const banner = document.getElementById('statusBanner');
+        const statusText = document.getElementById('statusText');
+        const statusSubtitle = document.getElementById('statusSubtitle');
+        const lastCheck = document.getElementById('lastCheck');
+
+        // Determine CSS class and display text from status
+        let cssClass = data.status;
+        let statusLabel = data.status;
+        let confidence = data.confidence || 0;
+        let direction = data.direction || '';
+
+        // Map compound statuses to CSS classes
+        if (data.status.startsWith('OPEN INBOUND')) {
+            cssClass = 'OPEN_INBOUND';
+            statusLabel = 'OPEN INBOUND ↙️';
+        } else if (data.status.startsWith('OPEN OUTBOUND')) {
+            cssClass = 'OPEN_OUTBOUND';
+            statusLabel = 'OPEN OUTBOUND ↗️';
+        } else if (data.status === 'OPEN UNRESTRICTED') {
+            cssClass = 'OPEN_UNRESTRICTED';
+            statusLabel = 'OPEN — UNRESTRICTED';
+        } else if (data.status.startsWith('LIKELY OPEN')) {
+            cssClass = 'LIKELY_OPEN';
+            statusLabel = data.status;
+        }
+
+        banner.className = 'status-banner ' + cssClass;
+        statusText.className = 'status-text' + (data.status === 'UNKNOWN' ? ' analyzing-indicator' : '');
+        statusText.textContent = data.status === 'UNKNOWN' ? 'CHECKING...' : 'HOV ' + statusLabel;
+
+        // Direction-aware subtitles
+        let subtitle = '';
+        if (data.status.includes('OPEN INBOUND')) {
+            subtitle = '✅ HOV is OPEN INBOUND (MM 5.5 → Downtown) — ' + confidence + '% confidence';
+        } else if (data.status.includes('OPEN OUTBOUND')) {
+            subtitle = '✅ HOV is OPEN OUTBOUND (Downtown → MM 5.5) — ' + confidence + '% confidence';
+        } else if (data.status === 'OPEN UNRESTRICTED') {
+            subtitle = '🔓 HOV lane is OPEN — no HOV 2+ restriction in effect';
+        } else if (data.status.includes('LIKELY OPEN')) {
+            subtitle = '🟠 HOV is LIKELY OPEN (' + confidence + '% confidence)';
+        } else if (data.status === 'CLOSED') {
+            if (data.next_period) {
+                subtitle = '🚫 HOV lane is CLOSED — ' + data.next_period;
+            } else if (direction === 'OUTBOUND') {
+                subtitle = '🚫 HOV lane is CLOSED (no outbound traffic detected)';
+            } else if (direction === 'INBOUND') {
+                subtitle = '🚫 HOV lane is CLOSED (no inbound traffic detected)';
+            } else {
+                subtitle = '🚫 HOV lane is CLOSED';
+            }
+        } else if (data.status === 'UNKNOWN') {
+            subtitle = '⏳ Analyzing camera feeds...';
+        } else {
+            subtitle = '';
+        }
+
+        // Add AI status indicator
+        if (data.ai_active === false) {
+            subtitle += ' | 🤖 AI analysis paused';
+        }
+
+        // Add direction mode indicator
+        if (data.period_label) {
+            subtitle += ' | ' + data.period_label;
+        }
+        statusSubtitle.textContent = subtitle;
+
+        if (data.last_check_display) {
+            lastCheck.textContent = 'Last checked: ' + data.last_check_display;
+        }
+
+        // Schedule info
+        const scheduleInfo = document.getElementById('scheduleInfo');
+        if (scheduleInfo && data.next_period) {
+            scheduleInfo.textContent = '⏭ Next: ' + data.next_period;
+        }
+
+        // Update all camera cards
+        ['bedford', 'mm55', 'mm12', 'mm14'].forEach(key => {
+            if (data[key]) {
+                updateCamera(key, data[key]);
+                if (data[key].image_b64) {
+                    const img = document.getElementById(key + 'Image');
+                    if (img && currentFeeds[key] === 'image') {
+                        img.src = 'data:image/jpeg;base64,' + data[key].image_b64;
+                    }
+                }
+            }
+        });
+    }
+
+    function updateCamera(key, cam) {
+        const statusEl = document.getElementById(key + 'Status');
+        const reasoningEl = document.getElementById(key + 'Reasoning');
+
+        if (statusEl) {
+            statusEl.textContent = cam.status || 'UNKNOWN';
+            statusEl.className = 'camera-status ' + (cam.status || 'UNKNOWN');
+        }
+
+        if (reasoningEl && cam.reasoning) {
+            reasoningEl.textContent = cam.reasoning;
+        }
+    }
+
+    // Trigger manual analysis
+    async function triggerAnalysis() {
+        const btn = document.getElementById('analyzeBtn');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="loading-spinner"></span> Analyzing...';
+
+        try {
+            const resp = await fetch('/api/analyze', { method: 'POST' });
+            const data = await resp.json();
+            updateUI(data);
+        } catch (e) {
+            console.error('Analysis failed:', e);
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '🔍 Analyze Now';
+        }
+    }
+
+    // Toggle auto-refresh
+    function toggleAutoRefresh() {
+        autoRefresh = !autoRefresh;
+        const btn = document.getElementById('autoRefreshBtn');
+        btn.textContent = '🔄 Auto-Refresh: ' + (autoRefresh ? 'ON' : 'OFF');
+        btn.className = 'btn' + (autoRefresh ? ' active' : '');
+
+        if (autoRefresh) {
+            startIntervals();
+        } else {
+            stopIntervals();
+        }
+    }
+
+    // Switch between image and video feeds
+    async function switchFeed(camera, type, btnEl) {
+        const feedDiv = document.getElementById(camera + 'Feed');
+        const toggleBtns = btnEl.parentElement.querySelectorAll('button');
+        toggleBtns.forEach(b => b.classList.remove('active'));
+        btnEl.classList.add('active');
+
+        currentFeeds[camera] = type;
+
+        // Destroy existing HLS player if any
+        if (hlsPlayers[camera]) {
+            hlsPlayers[camera].destroy();
+            delete hlsPlayers[camera];
+        }
+
+        if (type === 'image') {
+            feedDiv.innerHTML = `<img id="${camera}Image" src="/api/camera/${camera}/image?t=${Date.now()}" alt="Camera">`;
+        } else {
+            feedDiv.innerHTML = '<div class="no-video-msg">Loading video stream...</div>';
+
+            try {
+                const resp = await fetch(`/api/camera/${camera}/video-token`);
+                const data = await resp.json();
+
+                if (data.error) {
+                    feedDiv.innerHTML = `<div class="no-video-msg">Video unavailable: ${data.error}</div>`;
+                    return;
+                }
+
+                const videoEl = document.createElement('video');
+                videoEl.id = camera + 'Video';
+                videoEl.controls = true;
+                videoEl.autoplay = true;
+                videoEl.muted = true;
+                videoEl.playsInline = true;
+                feedDiv.innerHTML = '';
+                feedDiv.appendChild(videoEl);
+
+                if (Hls.isSupported()) {
+                    const hls = new Hls({
+                        enableWorker: true,
+                        lowLatencyMode: true
+                    });
+                    hls.loadSource(data.url);
+                    hls.attachMedia(videoEl);
+                    hls.on(Hls.Events.ERROR, function(event, errorData) {
+                        if (errorData.fatal) {
+                            feedDiv.innerHTML = '<div class="no-video-msg">Video stream error. Try again.</div>';
+                        }
+                    });
+                    hlsPlayers[camera] = hls;
+                } else if (videoEl.canPlayType('application/vnd.apple.mpegurl')) {
+                    videoEl.src = data.url;
+                }
+            } catch (e) {
+                feedDiv.innerHTML = `<div class="no-video-msg">Failed to load video: ${e.message}</div>`;
+            }
+        }
+    }
+
+    // Refresh camera images
+    function refreshImages() {
+        ['bedford', 'mm55', 'mm12', 'mm14'].forEach(camera => {
+            if (currentFeeds[camera] === 'image') {
+                const img = document.getElementById(camera + 'Image');
+                if (img) {
+                    img.src = `/api/camera/${camera}/image?t=${Date.now()}`;
+                }
+            }
+        });
+    }
+
+    function startIntervals() {
+        stopIntervals();
+        statusInterval = setInterval(fetchStatus, 15000);  // Check status every 15s
+        imageInterval = setInterval(refreshImages, 10000);  // Refresh images every 10s
+    }
+
+    function stopIntervals() {
+        if (statusInterval) clearInterval(statusInterval);
+        if (imageInterval) clearInterval(imageInterval);
+    }
+
+    // Initialize
+    fetchStatus();
+    startIntervals();
+</script>
+
+</body>
+</html>

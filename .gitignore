@@ -1,0 +1,19 @@
+# Azure Developer CLI
+.azure/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# IDE
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+
+# Screenshots (not needed in repo)
+*.png

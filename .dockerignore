@@ -1,0 +1,11 @@
+.azure/
+.git/
+__pycache__/
+*.pyc
+*.pyo
+*.code-workspace
+infra/
+.dockerignore
+Dockerfile
+.gitignore
+*.md
