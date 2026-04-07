@@ -10,7 +10,9 @@ import base64
 import io
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import time
 import threading
 from datetime import datetime
@@ -122,6 +124,110 @@ def call_vision_model(prompt, image_b64):
         max_tokens=300,
     )
     return response.choices[0].message.content
+
+
+def call_vision_model_multi(prompt, images_b64):
+    """Send multiple images + prompt to Azure OpenAI GPT-4o.
+    images_b64 is a list of base64-encoded JPEG strings."""
+    client = get_openai_client()
+    content = [{"type": "text", "text": prompt}]
+    for img_b64 in images_b64:
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{img_b64}",
+                "detail": "low",
+            },
+        })
+    response = client.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        messages=[{"role": "user", "content": content}],
+        temperature=0.1,
+        max_tokens=400,
+    )
+    return response.choices[0].message.content
+
+
+def get_bedford_video_url():
+    """Get the authenticated HLS stream URL for Bedford Ave."""
+    cam = CAMERAS["bedford"]
+    resp1 = requests.get(
+        "https://www.511pa.com/Camera/GetVideoUrl"
+        f"?imageId={cam['video_image_id']}",
+        timeout=10,
+    )
+    resp1.raise_for_status()
+    auth_data = resp1.json()
+
+    resp2 = requests.post(
+        "https://pa.arcadis-ivds.com"
+        "/api/SecureTokenUri/GetSecureTokenUriBySourceId",
+        json=auth_data,
+        headers={"Content-Type": "application/json"},
+        timeout=10,
+    )
+    resp2.raise_for_status()
+    token_query = resp2.json()
+
+    base_url = (
+        "https://pa-se4.arcadis-ivds.com:8200"
+        "/chan-4321/index.m3u8"
+    )
+    return base_url + token_query
+
+
+def capture_video_frames(duration=15, fps=1):
+    """Capture frames from Bedford Ave HLS video stream.
+
+    Uses ffmpeg to read ~duration seconds of live video and
+    extract frames at the given fps. Returns list of JPEG bytes.
+    """
+    try:
+        stream_url = get_bedford_video_url()
+    except Exception as e:
+        print(f"  [Video] Failed to get stream URL: {e}")
+        return []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_pattern = os.path.join(tmpdir, "frame_%03d.jpg")
+        cmd = [
+            "ffmpeg",
+            "-y",                       # overwrite
+            "-loglevel", "error",
+            "-i", stream_url,
+            "-t", str(duration),        # capture duration
+            "-vf", f"fps={fps}",        # extract at fps
+            "-q:v", "2",                # JPEG quality
+            output_pattern,
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=duration + 30,  # generous timeout
+            )
+            if result.returncode != 0:
+                print(f"  [Video] ffmpeg error: "
+                      f"{result.stderr[:300]}")
+                return []
+        except subprocess.TimeoutExpired:
+            print("  [Video] ffmpeg timed out")
+            return []
+        except FileNotFoundError:
+            print("  [Video] ffmpeg not found")
+            return []
+
+        # Read extracted frames
+        frames = []
+        for fname in sorted(os.listdir(tmpdir)):
+            if fname.endswith(".jpg"):
+                fpath = os.path.join(tmpdir, fname)
+                with open(fpath, "rb") as f:
+                    frames.append(f.read())
+
+        print(f"  [Video] Captured {len(frames)} frames "
+              f"over {duration}s")
+        return frames
 
 # Global state
 status_cache = {
@@ -334,6 +440,74 @@ Respond with ONLY this JSON:
         }
 
 
+def analyze_bedford_video(direction):
+    """Capture ~15s of Bedford Ave video and analyze all
+    frames together in a single GPT-4o call.
+
+    Returns dict matching analyze_bedford_image format.
+    """
+    frames = capture_video_frames(duration=15, fps=1)
+    if not frames:
+        print("  [Video] No frames captured, falling back "
+              "to snapshot")
+        return None
+
+    # Preprocess each frame (crop + enhance like snapshots)
+    processed_b64 = []
+    for frame_bytes in frames:
+        enhanced = preprocess_image(frame_bytes)
+        processed_b64.append(
+            base64.b64encode(enhanced).decode("utf-8")
+        )
+
+    dir_label = "entering" if direction == "OUTBOUND" else "exiting"
+
+    prompt = (
+        f"These are {len(processed_b64)} consecutive frames "
+        f"(1 per second) from a traffic camera at an HOV lane "
+        f"entrance/exit ramp. Look across ALL frames for any "
+        f"vehicles {dir_label} the HOV ramp. A vehicle may "
+        f"appear in only 2-3 frames as it passes through. "
+        f"Count the TOTAL unique vehicles you see across all "
+        f"frames (don't double-count the same car). "
+        f"For each vehicle note its color. "
+        f"Respond with ONLY this JSON:\n"
+        '{"total_vehicles": number, '
+        '"white_vehicle_present": true/false, '
+        '"other_vehicles_present": true/false, '
+        '"vehicle_description": "brief description or '
+        'no vehicles"}'
+    )
+
+    try:
+        response_text = call_vision_model_multi(
+            prompt, processed_b64
+        )
+        print(f"[AI Bedford Video raw] "
+              f"{response_text[:300]}")
+
+        try:
+            start = response_text.find("{")
+            end = response_text.rfind("}") + 1
+            if start >= 0 and end > start:
+                result = json.loads(
+                    response_text[start:end]
+                )
+                result["_source"] = "video"
+                result["_frames"] = len(processed_b64)
+                return result
+        except json.JSONDecodeError:
+            pass
+
+        return {"total_vehicles": 0,
+                "vehicle_description": response_text[:200],
+                "_source": "video"}
+
+    except Exception as e:
+        print(f"Bedford video analysis error: {e}")
+        return None
+
+
 def preprocess_mm55_image(image_bytes):
     """Crop to right 50% of MM 5.5 image (the highway side),
     enhance for vehicle/lane visibility."""
@@ -495,57 +669,67 @@ def run_analysis():
     now = now_eastern()
 
     print(f"\n[{now.strftime('%H:%M:%S')}] Starting "
-          f"multi-frame capture ({CAPTURE_FRAMES} frames "
-          f"over {CAPTURE_FRAMES * CAPTURE_INTERVAL}s)...")
+          f"analysis cycle...")
 
-    # --- Capture frames from all 4 cameras ---
-    bedford_frames = []
+    # --- Capture Bedford video + snapshot frames for other cameras ---
+    print("  Capturing Bedford Ave video (15s)...")
+    bedford_video_result = analyze_bedford_video(direction)
+
+    # Capture snapshot frames from all 4 cameras while
+    # we process the video result
     mm55_frames = []
     mm12_frames = []
     mm14_frames = []
+    bedford_snapshot = None  # single snapshot for display
     for i in range(CAPTURE_FRAMES):
-        for key, lst in [("bedford", bedford_frames),
-                         ("mm55", mm55_frames),
+        for key, lst in [("mm55", mm55_frames),
                          ("mm12", mm12_frames),
                          ("mm14", mm14_frames)]:
             img = fetch_camera_image(key)
             if img:
                 lst.append(img)
+        if bedford_snapshot is None:
+            bedford_snapshot = fetch_camera_image("bedford")
         print(f"  Frame {i+1}/{CAPTURE_FRAMES} captured "
-              f"(all 4 cameras)")
+              f"(mm55/mm12/mm14)")
         if i < CAPTURE_FRAMES - 1:
             time.sleep(CAPTURE_INTERVAL)
 
-    print(f"  Captured: Bedford={len(bedford_frames)}, "
-          f"MM55={len(mm55_frames)}, "
+    print(f"  Captured: MM55={len(mm55_frames)}, "
           f"MM12={len(mm12_frames)}, "
           f"MM14={len(mm14_frames)}. Analyzing...")
 
-    # --- Analyze all Bedford frames, pick best ---
-    best_bedford = None
-    best_bedford_total = -1
-    best_bedford_img = None
+    # --- Bedford analysis: prefer video, fall back to snapshot ---
+    if bedford_video_result is not None:
+        analysis = bedford_video_result
+        source = "video"
+        n_frames = analysis.get("_frames", "?")
+        print(f"  Bedford video analysis: "
+              f"{analysis.get('total_vehicles', 0)} vehicles "
+              f"({n_frames} frames)")
+    elif bedford_snapshot:
+        analysis = analyze_bedford_image(bedford_snapshot)
+        source = "snapshot"
+        print(f"  Bedford snapshot fallback: "
+              f"{analysis.get('total_vehicles', 0)} vehicles")
+    else:
+        analysis = None
+        source = None
 
-    for idx, img_bytes in enumerate(bedford_frames):
-        analysis = analyze_bedford_image(img_bytes)
-        total = analysis.get("total_vehicles", 0)
-        print(f"  Bedford frame {idx+1}: {total} vehicles")
-        if total > best_bedford_total:
-            best_bedford_total = total
-            best_bedford = analysis
-            best_bedford_img = img_bytes
+    # Use latest snapshot for display image
+    bedford_display_img = bedford_snapshot
 
-    if best_bedford is None:
+    if analysis is None:
         bedford_result = {
             "status": "ERROR",
-            "reasoning": "Failed to fetch camera image",
+            "reasoning": "Failed to fetch camera image/video",
             "image_b64": None,
         }
     else:
-        bedford_b64 = base64.b64encode(
-            best_bedford_img
-        ).decode("utf-8")
-        analysis = best_bedford
+        bedford_b64 = (
+            base64.b64encode(bedford_display_img).decode("utf-8")
+            if bedford_display_img else None
+        )
 
         vehicle_desc = analysis.get("vehicle_description", "")
         white_present = analysis.get("white_vehicle_present", False)
@@ -613,10 +797,18 @@ def run_analysis():
             confidence = 100
             parts.append("Outside HOV operating hours")
 
+        source_label = (
+            f"[{source}: {analysis.get('_frames', '?')} frames]"
+            if source == "video" else "[snapshot]"
+        )
+
         bedford_result = {
             "status": hov_status,
             "confidence": confidence,
-            "reasoning": ". ".join(parts)[:400],
+            "reasoning": (
+                f"{source_label} "
+                + ". ".join(parts)
+            )[:400],
             "image_b64": bedford_b64,
             "full_analysis": analysis,
         }
