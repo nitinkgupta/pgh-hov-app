@@ -585,8 +585,20 @@ def analyze_roadway_vehicles(image_bytes, camera_name=""):
     img = Image.open(io.BytesIO(image_bytes))
     w, h = img.size
 
+    # Crop to center HOV roadway area to exclude outer lanes.
+    # MM 1.2: HOV curves through center ~20-80% width
+    # MM 1.4: HOV is the center-left roadway ~15-65% width
+    if camera_name == "MM14":
+        cropped = img.crop((int(w * 0.15), int(h * 0.2),
+                            int(w * 0.65), int(h * 0.85)))
+    else:
+        cropped = img.crop((int(w * 0.2), int(h * 0.15),
+                            int(w * 0.8), int(h * 0.9)))
+
     # Upscale 2x for better detail
-    upscaled = img.resize((w * 2, h * 2), Image.LANCZOS)
+    upscaled = cropped.resize(
+        (cropped.width * 2, cropped.height * 2), Image.LANCZOS
+    )
     enhancer = ImageEnhance.Contrast(upscaled)
     enhanced = enhancer.enhance(1.5)
     enhancer = ImageEnhance.Sharpness(enhanced)
@@ -597,19 +609,14 @@ def analyze_roadway_vehicles(image_bytes, camera_name=""):
     img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
     prompt = (
-        "This traffic camera shows multiple roadways. "
-        "Focus ONLY on the narrow two-lane HOV ramp/roadway "
-        "that curves through the CENTER of the image — it has "
-        "white dashed center-line markings and solid white edge "
-        "lines. IGNORE all vehicles on the wider mainline "
-        "highways on the left and right sides of the image. "
-        "How many vehicles (cars, trucks, SUVs, buses) do you "
-        "see on that center HOV roadway ONLY? "
-        "If you see none on the center roadway, say 0. "
+        "This cropped traffic camera image shows ONLY the "
+        "HOV (High Occupancy Vehicle) roadway. How many "
+        "vehicles (cars, trucks, SUVs, buses) do you see "
+        "on this road? If you see none, say 0. "
         "Respond with ONLY this JSON: "
         '{"total_vehicles": number, '
         '"description": "brief description of vehicles on '
-        'the center HOV roadway, or no vehicles"}'
+        'the HOV roadway, or no vehicles"}'
     )
 
     try:
