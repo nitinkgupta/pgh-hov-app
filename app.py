@@ -148,9 +148,9 @@ def call_vision_model_multi(prompt, images_b64):
     return response.choices[0].message.content
 
 
-def get_bedford_video_url():
-    """Get the authenticated HLS stream URL for Bedford Ave."""
-    cam = CAMERAS["bedford"]
+def get_camera_video_url(camera_key):
+    """Get the authenticated HLS stream URL for any camera."""
+    cam = CAMERAS[camera_key]
     resp1 = requests.get(
         "https://www.511pa.com/Camera/GetVideoUrl"
         f"?imageId={cam['video_image_id']}",
@@ -169,23 +169,32 @@ def get_bedford_video_url():
     resp2.raise_for_status()
     token_query = resp2.json()
 
-    base_url = (
-        "https://pa-se4.arcadis-ivds.com:8200"
-        "/chan-4321/index.m3u8"
-    )
-    return base_url + token_query
+    # The videoUrl field from auth_data contains the stream URL
+    video_url = auth_data.get("videoUrl", "")
+    if not video_url:
+        # Fallback to known mappings
+        fallback = {
+            "bedford": "https://pa-se4.arcadis-ivds.com:8200/chan-4321/index.m3u8",
+            "mm55": "https://pa-se3.arcadis-ivds.com:8200/chan-3315/index.m3u8",
+        }
+        video_url = fallback.get(camera_key, "")
+    if not video_url:
+        raise ValueError(f"No video URL for {camera_key}")
+
+    return video_url + token_query
 
 
-def capture_video_frames(duration=15, fps=1):
-    """Capture frames from Bedford Ave HLS video stream.
+def capture_video_frames(camera_key, duration=15, fps=1):
+    """Capture frames from an HLS video stream.
 
     Uses ffmpeg to read ~duration seconds of live video and
     extract frames at the given fps. Returns list of JPEG bytes.
     """
     try:
-        stream_url = get_bedford_video_url()
+        stream_url = get_camera_video_url(camera_key)
     except Exception as e:
-        print(f"  [Video] Failed to get stream URL: {e}")
+        print(f"  [Video {camera_key}] "
+              f"Failed to get stream URL: {e}")
         return []
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -207,14 +216,14 @@ def capture_video_frames(duration=15, fps=1):
                 timeout=duration + 30,  # generous timeout
             )
             if result.returncode != 0:
-                print(f"  [Video] ffmpeg error: "
+                print(f"  [Video {camera_key}] ffmpeg error: "
                       f"{result.stderr[:300]}")
                 return []
         except subprocess.TimeoutExpired:
-            print("  [Video] ffmpeg timed out")
+            print(f"  [Video {camera_key}] ffmpeg timed out")
             return []
         except FileNotFoundError:
-            print("  [Video] ffmpeg not found")
+            print(f"  [Video {camera_key}] ffmpeg not found")
             return []
 
         # Read extracted frames
@@ -225,8 +234,8 @@ def capture_video_frames(duration=15, fps=1):
                 with open(fpath, "rb") as f:
                     frames.append(f.read())
 
-        print(f"  [Video] Captured {len(frames)} frames "
-              f"over {duration}s")
+        print(f"  [Video {camera_key}] Captured {len(frames)} "
+              f"frames over {duration}s")
         return frames
 
 # Global state
@@ -446,7 +455,7 @@ def analyze_bedford_video(direction):
 
     Returns dict matching analyze_bedford_image format.
     """
-    frames = capture_video_frames(duration=15, fps=1)
+    frames = capture_video_frames("bedford", duration=15, fps=1)
     if not frames:
         print("  [Video] No frames captured, falling back "
               "to snapshot")
@@ -638,6 +647,90 @@ def analyze_roadway_vehicles(image_bytes, camera_name=""):
         print(f"{camera_name} analysis error: {e}")
         return {"total_vehicles": 0, "description": f"Error: {e}"}
 
+
+def analyze_roadway_video(camera_key, camera_name=""):
+    """Capture ~15s of video from MM 1.2 or MM 1.4 and
+    analyze all frames together for vehicles on the HOV
+    roadway. Returns dict with total_vehicles + description,
+    or None if video capture fails."""
+    frames = capture_video_frames(camera_key, duration=15, fps=1)
+    if not frames:
+        print(f"  [Video {camera_name}] No frames, "
+              "falling back to snapshots")
+        return None
+
+    # Crop and enhance each frame the same way as snapshots
+    processed_b64 = []
+    for frame_bytes in frames:
+        img = Image.open(io.BytesIO(frame_bytes))
+        w, h = img.size
+
+        if camera_name == "MM14":
+            cropped = img.crop((int(w * 0.15), int(h * 0.2),
+                                int(w * 0.65), int(h * 0.85)))
+        else:
+            cropped = img.crop((int(w * 0.2), int(h * 0.15),
+                                int(w * 0.8), int(h * 0.9)))
+
+        upscaled = cropped.resize(
+            (cropped.width * 2, cropped.height * 2),
+            Image.LANCZOS,
+        )
+        enhancer = ImageEnhance.Contrast(upscaled)
+        enhanced = enhancer.enhance(1.5)
+        enhancer = ImageEnhance.Sharpness(enhanced)
+        sharpened = enhancer.enhance(2.0)
+
+        buf = io.BytesIO()
+        sharpened.save(buf, format="JPEG", quality=95)
+        processed_b64.append(
+            base64.b64encode(buf.getvalue()).decode("utf-8")
+        )
+
+    prompt = (
+        f"These are {len(processed_b64)} consecutive frames "
+        f"(1 per second) from a traffic camera showing ONLY "
+        f"the HOV (High Occupancy Vehicle) roadway. "
+        f"Look across ALL frames for vehicles (cars, trucks, "
+        f"SUVs, buses) traveling on this road. A vehicle may "
+        f"appear in only a few frames as it passes. "
+        f"Count the TOTAL unique vehicles across all frames "
+        f"(don't double-count). If none, say 0. "
+        f"Respond with ONLY this JSON: "
+        '{"total_vehicles": number, '
+        '"description": "brief description of vehicles on '
+        'the HOV roadway, or no vehicles"}'
+    )
+
+    try:
+        response_text = call_vision_model_multi(
+            prompt, processed_b64
+        )
+        print(f"[AI {camera_name} Video raw] "
+              f"{response_text[:200]}")
+
+        try:
+            start = response_text.find("{")
+            end = response_text.rfind("}") + 1
+            if start >= 0 and end > start:
+                result = json.loads(
+                    response_text[start:end]
+                )
+                result["_source"] = "video"
+                result["_frames"] = len(processed_b64)
+                return result
+        except json.JSONDecodeError:
+            pass
+
+        return {"total_vehicles": 0,
+                "description": response_text[:200],
+                "_source": "video"}
+
+    except Exception as e:
+        print(f"{camera_name} video analysis error: {e}")
+        return None
+
+
 # Number of frames to capture per analysis cycle
 CAPTURE_FRAMES = 6
 CAPTURE_INTERVAL = 10  # seconds between frames (6 * 10 = 60s)
@@ -678,33 +771,38 @@ def run_analysis():
     print(f"\n[{now.strftime('%H:%M:%S')}] Starting "
           f"analysis cycle...")
 
-    # --- Capture Bedford video + snapshot frames for other cameras ---
+    # --- Capture Bedford video + MM 1.2/1.4 video in sequence ---
     print("  Capturing Bedford Ave video (15s)...")
     bedford_video_result = analyze_bedford_video(direction)
 
-    # Capture snapshot frames from all 4 cameras while
-    # we process the video result
+    print("  Capturing MM 1.2 video (15s)...")
+    mm12_video_result = analyze_roadway_video("mm12", "MM12")
+
+    print("  Capturing MM 1.4 video (15s)...")
+    mm14_video_result = analyze_roadway_video("mm14", "MM14")
+
+    # Capture snapshot frames for MM 5.5 + single snapshots
+    # for display on Bedford/MM12/MM14
     mm55_frames = []
-    mm12_frames = []
-    mm14_frames = []
-    bedford_snapshot = None  # single snapshot for display
+    bedford_snapshot = None
+    mm12_snapshot = None
+    mm14_snapshot = None
     for i in range(CAPTURE_FRAMES):
-        for key, lst in [("mm55", mm55_frames),
-                         ("mm12", mm12_frames),
-                         ("mm14", mm14_frames)]:
-            img = fetch_camera_image(key)
-            if img:
-                lst.append(img)
+        img = fetch_camera_image("mm55")
+        if img:
+            mm55_frames.append(img)
         if bedford_snapshot is None:
             bedford_snapshot = fetch_camera_image("bedford")
+        if mm12_snapshot is None:
+            mm12_snapshot = fetch_camera_image("mm12")
+        if mm14_snapshot is None:
+            mm14_snapshot = fetch_camera_image("mm14")
         print(f"  Frame {i+1}/{CAPTURE_FRAMES} captured "
-              f"(mm55/mm12/mm14)")
+              f"(mm55 + display snapshots)")
         if i < CAPTURE_FRAMES - 1:
             time.sleep(CAPTURE_INTERVAL)
 
-    print(f"  Captured: MM55={len(mm55_frames)}, "
-          f"MM12={len(mm12_frames)}, "
-          f"MM14={len(mm14_frames)}. Analyzing...")
+    print(f"  Captured: MM55={len(mm55_frames)}. Analyzing...")
 
     # --- Bedford analysis: prefer video, fall back to snapshot ---
     if bedford_video_result is not None:
@@ -876,56 +974,76 @@ def run_analysis():
         "vehicles_in_left_lane": mm55_vehicles,
     }
 
-    # --- MM 1.2 analysis (best of captured frames) ---
-    best_mm12_vehicles = 0
-    best_mm12_desc = "Could not analyze"
-    best_mm12_img = mm12_frames[0] if mm12_frames else None
-
-    for idx, img_bytes in enumerate(mm12_frames):
-        a = analyze_roadway_vehicles(img_bytes, "MM12")
-        v = a.get("total_vehicles", 0)
-        print(f"  MM12 frame {idx+1}: {v} vehicles")
-        if v > best_mm12_vehicles:
-            best_mm12_vehicles = v
-            best_mm12_desc = a.get("description", "")
-            best_mm12_img = img_bytes
+    # --- MM 1.2 analysis (video-first, snapshot fallback) ---
+    if mm12_video_result is not None:
+        best_mm12_vehicles = mm12_video_result.get(
+            "total_vehicles", 0
+        )
+        best_mm12_desc = mm12_video_result.get(
+            "description", ""
+        )
+        n_frames = mm12_video_result.get("_frames", "?")
+        mm12_source = f"video: {n_frames} frames"
+        print(f"  MM12 video: {best_mm12_vehicles} vehicles")
+    elif mm12_snapshot:
+        a = analyze_roadway_vehicles(mm12_snapshot, "MM12")
+        best_mm12_vehicles = a.get("total_vehicles", 0)
+        best_mm12_desc = a.get("description", "")
+        mm12_source = "snapshot"
+        print(f"  MM12 snapshot fallback: "
+              f"{best_mm12_vehicles} vehicles")
+    else:
+        best_mm12_vehicles = 0
+        best_mm12_desc = "Could not analyze"
+        mm12_source = "none"
 
     mm12_result = {
         "status": "OPEN" if best_mm12_vehicles > 0 else "CLOSED",
         "reasoning": (
+            f"[{mm12_source}] "
             f"{best_mm12_vehicles} vehicle(s) on HOV "
             f"roadway. {best_mm12_desc}"
         ),
         "image_b64": (
-            base64.b64encode(best_mm12_img).decode("utf-8")
-            if best_mm12_img else None
+            base64.b64encode(mm12_snapshot).decode("utf-8")
+            if mm12_snapshot else None
         ),
         "vehicles": best_mm12_vehicles,
     }
 
-    # --- MM 1.4 analysis (best of captured frames) ---
-    best_mm14_vehicles = 0
-    best_mm14_desc = "Could not analyze"
-    best_mm14_img = mm14_frames[0] if mm14_frames else None
-
-    for idx, img_bytes in enumerate(mm14_frames):
-        a = analyze_roadway_vehicles(img_bytes, "MM14")
-        v = a.get("total_vehicles", 0)
-        print(f"  MM14 frame {idx+1}: {v} vehicles")
-        if v > best_mm14_vehicles:
-            best_mm14_vehicles = v
-            best_mm14_desc = a.get("description", "")
-            best_mm14_img = img_bytes
+    # --- MM 1.4 analysis (video-first, snapshot fallback) ---
+    if mm14_video_result is not None:
+        best_mm14_vehicles = mm14_video_result.get(
+            "total_vehicles", 0
+        )
+        best_mm14_desc = mm14_video_result.get(
+            "description", ""
+        )
+        n_frames = mm14_video_result.get("_frames", "?")
+        mm14_source = f"video: {n_frames} frames"
+        print(f"  MM14 video: {best_mm14_vehicles} vehicles")
+    elif mm14_snapshot:
+        a = analyze_roadway_vehicles(mm14_snapshot, "MM14")
+        best_mm14_vehicles = a.get("total_vehicles", 0)
+        best_mm14_desc = a.get("description", "")
+        mm14_source = "snapshot"
+        print(f"  MM14 snapshot fallback: "
+              f"{best_mm14_vehicles} vehicles")
+    else:
+        best_mm14_vehicles = 0
+        best_mm14_desc = "Could not analyze"
+        mm14_source = "none"
 
     mm14_result = {
         "status": "OPEN" if best_mm14_vehicles > 0 else "CLOSED",
         "reasoning": (
+            f"[{mm14_source}] "
             f"{best_mm14_vehicles} vehicle(s) on HOV "
             f"roadway. {best_mm14_desc}"
         ),
         "image_b64": (
-            base64.b64encode(best_mm14_img).decode("utf-8")
-            if best_mm14_img else None
+            base64.b64encode(mm14_snapshot).decode("utf-8")
+            if mm14_snapshot else None
         ),
         "vehicles": best_mm14_vehicles,
     }
